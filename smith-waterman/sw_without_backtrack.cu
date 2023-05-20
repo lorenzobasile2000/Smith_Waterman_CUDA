@@ -68,39 +68,44 @@ int max4(int n1, int n2, int n3, int n4)
 
 __global__ void kernel_gpu(char * query_hw, char * ref_hw, int * res_hw){
     unsigned int threadId = threadIdx.x;
-    unsigned int len = SLEN + 1;
-    __shared__ int * score[2*len];
+    __shared__ int last_score[S_LEN+1];
+    __shared__ int pre_score[S_LEN+1];
     //extern __shared__ int dir[];
 
     //First of all, I need to initialize the score matrix
-    for(int i = 0 ; i< len; i++){
-        score[i*threadId] = 0;
+    pre_score[threadId] = 0;
+    last_score[threadId] = 0;
+    if(threadId==1){
+        pre_score[S_LEN+1] = 0;
+        last_score[S_LEN+1] = 0;
     }
     __syncthreads();
 
     //Compute score alignment
-    for(int j = 1; j<2*len; j++){
-        if(j>len)
-            threadId += len;
+    for(int j = 1; j<2*S_LEN; j++){
+        unsigned int index = threadId;
+        if(j <= S_LEN)
+            index++;
         if(threadId<= j){
-            unsigned int index = threadId * len + j;
-            unsigned int up = index - len;
-            unsigned int left = index - 1;
-            unsigned int upleft = index - len - 1;
+            unsigned int up = threadId+1;
+            unsigned int left = threadId;
+            unsigned int upleft = index - S_LEN;
 
             int tmp1, tmp2;
-            int compar = (query_hw[n][j - 1] == ref_hw[n][j - 1]) ? match : mismatch;
-            tmp1 = (score[upleft] + compar) > (score[left] +del) ? (score[upleft] + compar) : (score[left]+del);
-            tmp2 = (score[up] + ins) > 0 ? (score[up] + ins) : 0;
+            int compar = (query_hw[upleft] == ref_hw[upleft]) ? match : mismatch;
+            tmp1 = (pre_score[threadId] + compar) > (last_score[left] +del) ? (pre_score[threadId] + compar) : (last_score[left]+del);
+            tmp2 = (last_score[up] + ins) > 0 ? (last_score[up] + ins) : 0;
             tmp1 = tmp1 > tmp2 ? tmp1 : tmp2;
-            score[index] = tmp1;
-            
+            pre_score[threadId] = last_score[threadId];
+            if(threadId==0)
+                pre_score[S_LEN+1] = last_score[S_LEN+1];
+            last_score[index] = tmp1;            
         }
         __syncthreads();
     }
 
     //Publish resalt on global memory
-    res_hw[blockIdx.x] = score[2*len];
+    res_hw[blockIdx.x] = last_score[0];
 }
 
 int main(int argc, char *argv[])
@@ -129,8 +134,8 @@ int main(int argc, char *argv[])
     for (int i = 0; i < N; i++)
         simple_rev_cigar[i] = (char *)malloc(S_LEN * 2 * sizeof(char));
     */
-    int *res_sw, *res_hw;
-    char *query_hw, *ref_hw, 
+    int *res_hw;
+    char *query_hw, *ref_hw;
     //char *cigar_hw, *cigar_sw;
 
     int *res_sw = (int *)malloc(N * sizeof(int));
@@ -216,7 +221,7 @@ int main(int argc, char *argv[])
     dim3 blocksPerGrid (N, 1, 1);
     dim3 threadsPerBlock (S_LEN, 1, 1);
     // Change for backtracking
-    kernel_gpu<<<blocksPerGrid, threadsPerBlock>>>(query_hw, ref_hw);
+    kernel_gpu<<<blocksPerGrid, threadsPerBlock>>>(query_hw, ref_hw, res_hw);
     CHECK_KERNELCALL();
     CHECK(cudaDeviceSynchronize());
     double end_gpu = get_time();
@@ -232,12 +237,7 @@ int main(int argc, char *argv[])
     //CHECK(cudaFree(cigar_hw));
     CHECK(cudaFree(res_hw));
 
-    //Freeing host memory
-    free(query);
-    free(reference);
-    free(sc_mat);
-    free(res);
-    free(res_sw);
+    
 
     for(int i = 0; i< S_LEN; i++)
         if(res_sw[i]!=res[i]){
@@ -248,5 +248,12 @@ int main(int argc, char *argv[])
     printf("SW Time CPU: %.10lf\n", end_cpu - start_cpu);
     printf("SW Time GPU: %.10lf\n", end_gpu - start_gpu);
 
+    //Freeing host memory
+    free(query);
+    free(reference);
+    free(sc_mat);
+    free(res);
+    free(res_sw);    
+    
     return 0;
 }
