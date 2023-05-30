@@ -8,7 +8,7 @@
 #define N 1000
 #define ins -2
 #define del -2
-#define match -1
+#define match 1
 #define mismatch -1
 
 #define CHECK(call)                                                     \
@@ -70,42 +70,55 @@ __global__ void kernel_gpu(char * query_hw, char * ref_hw, int * res_hw){
     unsigned int threadId = threadIdx.x;
     __shared__ int last_score[S_LEN+1];
     __shared__ int pre_score[S_LEN+1];
+    unsigned int iteration = 0;
+    __shared__ int max;
+    __shared__ int maxi;
+    __shared__ int maxj;
     //extern __shared__ int dir[];
 
-    //First of all, I need to initialize the score matrix
+    //First of all, I need to initialize the three matrixdiagonals
     pre_score[threadId] = 0;
     last_score[threadId] = 0;
-    if(threadId==1){
-        pre_score[S_LEN+1] = 0;
-        last_score[S_LEN+1] = 0;
+    if(threadId==0){
+        pre_score[S_LEN] = 0;
+        last_score[S_LEN] = 0;
     }
     __syncthreads();
 
     //Compute score alignment
-    for(int j = 1; j<2*S_LEN; j++){
-        unsigned int index = threadId;
-        if(j <= S_LEN)
-            index++;
-        if(threadId<= j){
+    for(int j = 0; j<2*S_LEN -1; j++){
+        unsigned int tmp = 0;
+        if(threadId<=j && iteration <S_LEN){
             unsigned int up = threadId+1;
             unsigned int left = threadId;
-            unsigned int upleft = index - S_LEN;
-
+            unsigned int upleft = threadId;
+            unsigned int ind_ref = blockIdx.x * S_LEN + threadId;
+            unsigned int ind_q = blockIdx.x * S_LEN + iteration ;
+            
             int tmp1, tmp2;
-            int compar = (query_hw[upleft] == ref_hw[upleft]) ? match : mismatch;
-            tmp1 = (pre_score[threadId] + compar) > (last_score[left] +del) ? (pre_score[threadId] + compar) : (last_score[left]+del);
+            int compar = (query_hw[ind_q] == ref_hw[ind_ref]) ? match : mismatch;
+
+            //Compute the maximum
+            tmp1 = (pre_score[upleft] + compar) > (last_score[left] +del) ? (pre_score[upleft] + compar) : (last_score[left]+del);
             tmp2 = (last_score[up] + ins) > 0 ? (last_score[up] + ins) : 0;
-            tmp1 = tmp1 > tmp2 ? tmp1 : tmp2;
-            pre_score[threadId] = last_score[threadId];
-            if(threadId==0)
-                pre_score[S_LEN+1] = last_score[S_LEN+1];
-            last_score[index] = tmp1;            
+            tmp = tmp1 > tmp2 ? tmp1 : tmp2;
+
+            if(tmp>max){
+                max = tmp;
+                maxi = ind_q;
+                maxj = ind_ref;
+            }
+            iteration++;         
         }
+        __syncthreads();
+        pre_score[threadId+1] = last_score[threadId+1];
+        last_score[threadId+1] = tmp;
+        
         __syncthreads();
     }
 
-    //Publish resalt on global memory
-    res_hw[blockIdx.x] = last_score[0];
+    //Publish result on global memory
+    res_hw[blockIdx.x] = max;
 }
 
 int main(int argc, char *argv[])
@@ -115,10 +128,12 @@ int main(int argc, char *argv[])
     char alphabet[5] = {'A', 'C', 'G', 'T', 'N'};
 
     char **query = (char **)malloc(N * sizeof(char *));
+    char * query_gpu = (char *)malloc(N*S_LEN*sizeof(char));
     for (int i = 0; i < N; i++)
         query[i] = (char *)malloc(S_LEN * sizeof(char));
 
     char **reference = (char **)malloc(N * sizeof(char *));
+    char * reference_gpu = (char *)malloc(N*S_LEN*sizeof(char));
     for (int i = 0; i < N; i++)
         reference[i] = (char *)malloc(S_LEN * sizeof(char));
 
@@ -154,10 +169,23 @@ int main(int argc, char *argv[])
         for (int j = 0; j < S_LEN; j++)
         {
             query[i][j] = alphabet[rand() % 5];
+            query_gpu[i*S_LEN+j] = query[i][j];
             reference[i][j] = alphabet[rand() % 5];
+            reference_gpu[i*S_LEN+j] = reference[i][j];
         }
     }
 
+    /*printf("query\n");
+    for (int j = 0; j < S_LEN; j++)
+        {
+            printf("%c", query[1][j]);
+        }
+    printf("\nref\n");
+    for (int j = 0; j < S_LEN; j++)
+        {
+            printf("%c", reference[1][j]);
+        }    
+    printf("\n");  */
     double start_cpu = get_time();
 
     for (int n = 0; n < N; n++)
@@ -213,8 +241,8 @@ int main(int argc, char *argv[])
 
 
     // Data transmission: CPU -> GPU
-    CHECK(cudaMemcpy(query_hw, query, N*S_LEN*sizeof(char), cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(ref_hw, reference, N*S_LEN*sizeof(char), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(query_hw, query_gpu, N*S_LEN*sizeof(char), cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(ref_hw, reference_gpu, N*S_LEN*sizeof(char), cudaMemcpyHostToDevice));
 
     double start_gpu = get_time();
     //Kernel launch
@@ -228,7 +256,7 @@ int main(int argc, char *argv[])
 
 
     //Data transmission: GPU -> CPU
-    CHECK(cudaMemcpy(res_sw, res_hw, N*sizeof(char), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(res_sw, res_hw, N*sizeof(int), cudaMemcpyDeviceToHost));
     //CHECK(cudaMemcpy(cigar_sw, cigar_hw, N*2*S_LEN*sizeof(char), cudaMemcpyDeviceToHost));
 
     //Freeing memory on device
@@ -239,7 +267,7 @@ int main(int argc, char *argv[])
 
     
 
-    for(int i = 0; i< S_LEN; i++)
+    for(int i = 0; i< N; i++)
         if(res_sw[i]!=res[i]){
             printf("GPU result error!\n");
             break;
@@ -247,6 +275,14 @@ int main(int argc, char *argv[])
 
     printf("SW Time CPU: %.10lf\n", end_cpu - start_cpu);
     printf("SW Time GPU: %.10lf\n", end_gpu - start_gpu);
+
+    /*printf("CPU: \n");
+    for(int i=0; i<N; i++)
+      printf("%d ", res[i]);
+
+    printf("\nGPU: \n");
+    for(int i=0; i<N; i++)
+      printf("%d ", res_sw[i]);*/
 
     //Freeing host memory
     free(query);
